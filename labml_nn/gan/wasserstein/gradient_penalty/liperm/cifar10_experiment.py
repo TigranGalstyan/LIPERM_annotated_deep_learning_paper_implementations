@@ -1,10 +1,10 @@
 """
 ---
-title: LIPERM WGAN-GP experiment with MNIST
-summary: This experiment generates MNIST images using convolutional neural network.
+title: LIPERM WGAN-GP experiment with CIFAR10
+summary: This experiment generates CIFAR10 images using convolutional neural network.
 ---
 
-# LIPERM WGAN-GP experiment with MNIST
+# LIPERM WGAN-GP experiment with CIFAR10
 """
 from typing import Any
 
@@ -39,12 +39,12 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
     """
     ## Configurations
 
-    This extends MNIST configurations to get the data loaders and Training and validation loop
+    This extends CIFAR10 configurations to get the data loaders and Training and validation loop
     configurations to simplify our implementation.
     """
 
     device: torch.device = DeviceConfigs()
-    dataset_transforms = 'mnist_gan_transforms'
+    dataset_transforms = 'cifar10_transforms'
     epochs: int = 10
     latent_dim: int = 128
 
@@ -269,34 +269,9 @@ def _inverse_generator_optimizer(c: Configs):
     return opt_conf
 
 
-def main():
-    # # Create configs object
-    # conf = Configs()
-    # # Create experiment
-    exp_name = 'CIFAR10_0.0'
-    experiment.create(name=exp_name, writers={'tensorboard'})
-    # # Override configurations
-    # experiment.configs(conf,
-    #                    {
-    #                        'discriminator': 'conv',
-    #                        'generator': 'resnet',
-    #                        'label_smoothing': 0.0,
-    #                        'generator_loss': 'wasserstein',
-    #                        'discriminator_loss': 'wasserstein',
-    #                        'discriminator_k': 5,
-    #                        'train_batch_size': 256,
-    #                        'valid_batch_size': 256,
-    #                        'epochs': 160,
-    #                        'inverse_penalty_coefficient': 8.0,
-    #                    })
-    #
-    # experiment.add_pytorch_models({'generator': conf.generator,
-    #                                'discriminator': conf.discriminator,
-    #                                'inverse_generator': conf.inverse_generator})
-    # with experiment.start():
-    #     conf.run()
+def continue_experiment(run_uuid, exp_name='debug'):
 
-    run_uuid = "58a2df54cc1e11ee8085305a3a57bc3c"
+    experiment.create(name=exp_name, writers={'tensorboard'})
 
     # Create configs
     conf = Configs()
@@ -317,6 +292,34 @@ def main():
     # Load training experiment
     experiment.load(run_uuid)
 
+    with experiment.start():
+        conf.run()
+
+
+def main():
+    # Create configs object
+    conf = Configs()
+    # Create experiment
+    exp_name = 'CIFAR10_1.0'
+    experiment.create(name=exp_name, writers={'tensorboard'})
+    # Override configurations
+    experiment.configs(conf,
+                       {
+                           'discriminator': 'conv',
+                           'generator': 'resnet',
+                           'label_smoothing': 0.0,
+                           'generator_loss': 'wasserstein',
+                           'discriminator_loss': 'wasserstein',
+                           'discriminator_k': 5,
+                           'train_batch_size': 256,
+                           'valid_batch_size': 256,
+                           'epochs': 300,
+                           'inverse_penalty_coefficient': 8.0,
+                       })
+
+    experiment.add_pytorch_models({'generator': conf.generator,
+                                   'discriminator': conf.discriminator,
+                                   'inverse_generator': conf.inverse_generator})
     with experiment.start():
         conf.run()
 
