@@ -45,8 +45,15 @@ Here is the [code for an experiment](experiment.html) that uses gradient penalty
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
 from labml_helpers.module import Module
+from torch.utils.data.dataset import T_co
+from torchvision import datasets, transforms
+
+from labml import lab
+from labml.configs import BaseConfigs
+from sklearn.datasets import make_swiss_roll
 
 
 class InverseGeneratorLoss(Module):
@@ -225,3 +232,99 @@ def _weights_init(m):
         nn.init.constant_(m.bias.data, 0)
 
 
+#  Swiss Roll Experiment
+
+
+class SwissRollDataset(Dataset):
+
+    def __init__(self, size):
+        self.data = data = make_swiss_roll(
+                n_samples=size,
+                noise=1.5,
+                random_state=1234
+            )[0].astype('float32')[:, (0, 2)]
+        self.data = self.data / 7.5  # stdev plus a little
+        self.len = size
+
+    def __getitem__(self, index) -> torch.Tensor:
+        return data[index]
+
+    def __getitems__(self, indices: List) -> List[T_co]:
+    Not implemented to prevent false-positives in fetcher check in
+    torch.utils.data._utils.fetch._MapDatasetFetcher
+
+    def __len__(self):
+        return self.len
+
+
+def _dataset(is_train, transform):
+    return datasets.CIFAR10(str(lab.get_data_path()),
+                            train=is_train,
+                            download=True,
+                            transform=transform)
+
+
+class SwissRollConfigs(BaseConfigs):
+    """
+    Configurable SwissRoll data set.
+
+    Arguments:
+        dataset_name (str): name of the data set, ``CIFAR10``
+        dataset_transforms (torchvision.transforms.Compose): image transformations
+        train_dataset (torchvision.datasets.CIFAR10): training dataset
+        valid_dataset (torchvision.datasets.CIFAR10): validation dataset
+
+        train_loader (torch.utils.data.DataLoader): training data loader
+        valid_loader (torch.utils.data.DataLoader): validation data loader
+
+        train_batch_size (int): training batch size
+        valid_batch_size (int): validation batch size
+
+        train_loader_shuffle (bool): whether to shuffle training data
+        valid_loader_shuffle (bool): whether to shuffle validation data
+    """
+    dataset_name: str = 'SwissRoll'
+    train_dataset: datasets.CIFAR10
+    valid_dataset: datasets.CIFAR10
+
+    train_loader: DataLoader
+    valid_loader: DataLoader
+
+    train_batch_size: int = 64
+    valid_batch_size: int = 1024
+
+    train_loader_shuffle: bool = True
+    valid_loader_shuffle: bool = False
+
+
+
+@CIFAR10Configs.calc(CIFAR10Configs.train_dataset)
+def cifar10_train_dataset(c: CIFAR10Configs):
+    return _dataset(True, c.dataset_transforms)
+
+
+@CIFAR10Configs.calc(CIFAR10Configs.valid_dataset)
+def cifar10_valid_dataset(c: CIFAR10Configs):
+    return _dataset(False, c.dataset_transforms)
+
+
+@CIFAR10Configs.calc(CIFAR10Configs.train_loader)
+def cifar10_train_loader(c: CIFAR10Configs):
+    return DataLoader(c.train_dataset,
+                      batch_size=c.train_batch_size,
+                      shuffle=c.train_loader_shuffle)
+
+
+@CIFAR10Configs.calc(CIFAR10Configs.valid_loader)
+def cifar10_valid_loader(c: CIFAR10Configs):
+    return DataLoader(c.valid_dataset,
+                      batch_size=c.valid_batch_size,
+                      shuffle=c.valid_loader_shuffle)
+
+
+CIFAR10Configs.aggregate(CIFAR10Configs.dataset_name, 'CIFAR10',
+                       (CIFAR10Configs.dataset_transforms, 'cifar10_transforms'),
+                       (CIFAR10Configs.train_dataset, 'cifar10_train_dataset'),
+                       (CIFAR10Configs.valid_dataset, 'cifar10_valid_dataset'),
+                       (CIFAR10Configs.train_loader, 'cifar10_train_loader'),
+                       (CIFAR10Configs.valid_loader, 'cifar10_valid_loader'))
