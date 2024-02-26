@@ -89,6 +89,11 @@ class Configs(OriginalConfigs):
         """
         super().step(batch, batch_idx)
         batch_size = batch[0].shape[0]
+
+        # Memory leak workaround
+        if len(self.inception_metric.features) > 500:
+            self.inception_metric.reset()
+
         if tracker.get_global_step() < batch_idx.total * batch_size:
             # Get MNIST images
             data = batch[0].to(self.device)
