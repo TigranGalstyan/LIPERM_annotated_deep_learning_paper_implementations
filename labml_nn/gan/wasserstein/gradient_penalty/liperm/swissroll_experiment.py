@@ -9,22 +9,20 @@ summary: This experiment generates SwissRoll points.
 from typing import Any
 
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
+from torchvision import transforms
 
 
 from labml import tracker, monit, experiment
 from labml.configs import option, calculate
 
-
 from labml_nn.gan.wasserstein.gradient_penalty.liperm import InverseGeneratorLoss, \
     SwissRollGenerator, SwissRollDiscriminator, SwissRollInverseGenerator
 
 from labml_nn.gan.wasserstein.gradient_penalty import GradientPenalty
-
-
-import torch.utils.data
-
 
 from labml_helpers.device import DeviceConfigs
 from labml_helpers.module import Module
@@ -96,7 +94,7 @@ class Configs(SwissRollConfigs, TrainValidConfigs):
         self.discriminator.train(self.mode.is_train)
 
         # Get MNIST images
-        data = batch[0].to(self.device)
+        data = batch.to(self.device)
 
         # Increment step in training mode
         if self.mode.is_train:
@@ -176,10 +174,15 @@ class Configs(SwissRollConfigs, TrainValidConfigs):
         loss = generator_loss + self.inverse_penalty_coefficient * inverse_loss
 
         fig, ax = plt.subplots()
-        ax.scatter(generated_points[:, 0], generated_points[:, 1])
+        ## workaround
+        ax.scatter(self.train_dataset.data[::50, 0], self.train_dataset.data[::50, 1])
+        ###
+        ax.scatter(generated_points[:, 0].detach().cpu(), generated_points[:, 1].detach().cpu())
+        fig.canvas.draw()
         img = Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
+        plt.close()
         # Log stuff
-        tracker.add("generated", img)
+        tracker.add("generated", transforms.PILToTensor()(img))
         tracker.add("loss.generator.", generator_loss)
         tracker.add("loss.inverse_generator.", inverse_loss)
         tracker.add("loss.overall.", loss)
@@ -271,15 +274,13 @@ def main():
     # Override configurations
     experiment.configs(conf,
                        {
-                           'discriminator': 'conv',
-                           'generator': 'resnet',
                            'label_smoothing': 0.0,
                            'generator_loss': 'wasserstein',
                            'discriminator_loss': 'wasserstein',
                            'discriminator_k': 5,
                            'train_batch_size': 250,
                            'valid_batch_size': 1000,
-                           'epochs': 30,
+                           'epochs': 5000,
                            'inverse_penalty_coefficient': 0.0,
                        })
 
