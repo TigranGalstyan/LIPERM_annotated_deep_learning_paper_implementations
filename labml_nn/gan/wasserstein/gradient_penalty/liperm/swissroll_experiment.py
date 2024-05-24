@@ -14,6 +14,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
 from torchvision import transforms
+from scipy.spatial import KDTree
 
 
 from labml import tracker, monit, experiment
@@ -44,7 +45,8 @@ class Configs(SwissRollConfigs, TrainValidConfigs):
     epochs: int = 10
     latent_dim: int = 2
 
-    is_save_models = True
+    is_save_models = False
+    save_models_interval = 500
     discriminator: Module = 'mlp'
     generator: Module = 'mlp'
     generator_optimizer: torch.optim.Adam
@@ -66,11 +68,16 @@ class Configs(SwissRollConfigs, TrainValidConfigs):
     inverse_generator_loss = InverseGeneratorLoss()
     inverse_generator = 'mlp'
 
+    # For calculating minimum distance metric
+    kdtree = None
+
+
     def init(self):
         """
         Initializations
         """
         self.state_modules = []
+        self.kdtree = KDTree(self.train_dataset.data)
 
         hook_model_outputs(self.mode, self.generator, 'generator')
         hook_model_outputs(self.mode, self.discriminator, 'discriminator')
@@ -156,6 +163,7 @@ class Configs(SwissRollConfigs, TrainValidConfigs):
         # Log stuff
         tracker.add("loss.discriminator.true.", loss_true)
         tracker.add("loss.discriminator.false.", loss_false)
+        tracker.add("loss.discriminator.wasserstein.", - loss_true - loss_false)
         tracker.add("loss.discriminator.", loss)
 
         return loss
@@ -173,21 +181,31 @@ class Configs(SwissRollConfigs, TrainValidConfigs):
 
         loss = generator_loss + self.inverse_penalty_coefficient * inverse_loss
 
+        # Log stuff
+
+        generated_points_cpu = generated_points.detach().cpu()
+
         fig, ax = plt.subplots()
         ## workaround
-        ax.scatter(self.train_dataset.data[::50, 0], self.train_dataset.data[::50, 1])
+        ax.scatter(self.train_dataset.data[::10, 0], self.train_dataset.data[::10, 1])
         ###
-        ax.scatter(generated_points[:, 0].detach().cpu(), generated_points[:, 1].detach().cpu())
+        ax.scatter(generated_points_cpu[:, 0], generated_points_cpu[:, 1])
         fig.canvas.draw()
         img = Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
         plt.close()
-        # Log stuff
+
         tracker.add("generated", transforms.PILToTensor()(img))
         tracker.add("loss.generator.", generator_loss)
         tracker.add("loss.inverse_generator.", inverse_loss)
         tracker.add("loss.overall.", loss)
+        tracker.add("dissimilarity_score", self.calculate_dissimiliarity_score(generated_points_cpu, skip_step=1))
 
         return loss
+
+    def calculate_dissimiliarity_score(self, generated, skip_step=10):
+        # calculates the minimum distances, higher the better
+        distances, _ = self.kdtree.query(generated[::skip_step])
+        return distances.mean()
 
 
 calculate(Configs.generator, 'mlp', lambda c: SwissRollGenerator().to(c.device))
@@ -269,7 +287,7 @@ def main():
     # Create configs object
     conf = Configs()
     # Create experiment
-    exp_name = 'SwisRoll_0.0'
+    exp_name = 'SwisRoll_2.0'
     experiment.create(name=exp_name, writers={'tensorboard'})
     # Override configurations
     experiment.configs(conf,
@@ -278,10 +296,10 @@ def main():
                            'generator_loss': 'wasserstein',
                            'discriminator_loss': 'wasserstein',
                            'discriminator_k': 5,
-                           'train_batch_size': 250,
-                           'valid_batch_size': 1000,
+                           'train_batch_size': 200,
+                           'valid_batch_size': 200,
                            'epochs': 5000,
-                           'inverse_penalty_coefficient': 0.0,
+                           'inverse_penalty_coefficient': 2.0,
                        })
 
     experiment.add_pytorch_models({'generator': conf.generator,
