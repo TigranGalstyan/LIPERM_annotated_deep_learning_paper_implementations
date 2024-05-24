@@ -6,12 +6,16 @@ summary: This experiment generates CIFAR10 images using convolutional neural net
 
 # LIPERM WGAN-GP experiment with CIFAR10
 """
+import random
 from typing import Any
 
 import torch
+import numpy as np
+from sklearn.decomposition import PCA
 
 from torchvision.utils import make_grid
-from torchmetrics.image.fid import FrechetInceptionDistance
+# from torchmetrics.image.fid import FrechetInceptionDistance
+from scipy.stats import wasserstein_distance_nd #wasserstein_distance
 from torchmetrics.image.inception import InceptionScore
 
 from labml import tracker, monit, experiment
@@ -22,8 +26,6 @@ from labml_nn.gan.wasserstein.gradient_penalty.liperm import InverseGeneratorLos
     CIFAR10Generator, CIFAR10Discriminator, CIFAR10InverseGenerator
 
 from labml_nn.gan.wasserstein.gradient_penalty import GradientPenalty
-
-
 import torch.utils.data
 
 from labml_helpers.datasets.cifar10 import CIFAR10Configs
@@ -57,7 +59,7 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
     generator_loss: GeneratorLoss = 'original'
     discriminator_loss: DiscriminatorLoss = 'original'
     label_smoothing: float = 0.2
-    discriminator_k: int = 1
+    discriminator_k: int = 5
 
     # Gradient penalty coefficient $\lambda$
     gradient_penalty_coefficient: float = 1.0
@@ -69,8 +71,11 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
     #
     inverse_generator_loss = InverseGeneratorLoss()
     inverse_generator = 'cnn'
-    fid = FrechetInceptionDistance(normalize=True, reset_real_features=False, feature=2048)
-    inception_metric = InceptionScore(normalize=True)
+    inception_metric = InceptionScore(normalize=True, splits=1)
+    sample_train_images: torch.Tensor = None
+    sample_val_images: torch.Tensor = None
+    pca_instance: PCA = None
+    valid_loader_shuffle: True
 
     def init(self):
         """
@@ -85,8 +90,24 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
         tracker.set_image("generated", True)
 
         if self.device.type == 'cuda':
-            self.fid.cuda(self.device)
             self.inception_metric.cuda(self.device)
+
+        self.sample_train_images = torch.stack(self.collect_sample_images(train=True)).flatten(start_dim=1)
+        self.sample_val_images = torch.stack(self.collect_sample_images(train=False, num=256)).flatten(start_dim=1)
+
+        self.pca_instance = PCA(n_components=10)
+        self.pca_instance.fit(self.sample_train_images)
+
+    def collect_sample_images(self, train=True, num=1024):
+        samples = []
+        if train:
+            dataset = self.train_dataset
+        else:
+            dataset = self.valid_dataset
+
+        for i in np.random.permutation(np.arange(len(dataset)))[:num]:
+            samples.append(self.train_dataset[i][0])
+        return samples
 
     def sample_z(self, batch_size: int):
         """
@@ -109,9 +130,6 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
         # Increment step in training mode
         if self.mode.is_train:
             tracker.add_global_step(len(data))
-
-        if len(self.inception_metric.features) > 500:  # Memory leak workaround
-            self.inception_metric.reset()
 
         # Train the discriminator
         with monit.section("discriminator"):
@@ -142,15 +160,15 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
                     self.inverse_generator_optimizer.step()
 
         batch_size = batch[0].shape[0]
-        # if tracker.get_global_step() < batch_idx.total * batch_size:
-        self.fid.update((data + 1.0) / 2.0, real=True)
 
-        # Compute metrics once in every `discriminator_k`
-        if batch_idx.is_interval(self.discriminator_k):
-            fid_score, inception_score = self.get_fid_and_inception_score(batch_size=batch_size)
-            tracker.add("FrechetInceptionDistance.", fid_score)
+        # # Compute metrics once in every `discriminator_k`
+        # if batch_idx.is_interval(self.discriminator_k):
+        if not self.mode.is_train and batch_idx.is_last:
+            inception_score, pca_score, train_wd, val_wd = self.get_scores(batch_size=batch_size)
             tracker.add("InceptionScore.", inception_score)
-
+            tracker.add("WassersteinDistanceTrain.", train_wd)
+            tracker.add("WassersteinDistanceVal.", val_wd)
+            tracker.add("PCAScore.", pca_score)
         tracker.save()
 
     def calc_discriminator_loss(self, data: torch.Tensor):
@@ -205,20 +223,26 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
 
         return loss
 
-    def get_fid_and_inception_score(self, batch_size=100):
+    def get_scores(self, batch_size=100):
         with torch.no_grad():
             latent = self.sample_z(batch_size)
             generated_images = self.generator(latent)
+            samples = (generated_images + 1) / 2
+            generated_images = generated_images.detach().cpu().flatten(start_dim=1)
 
-        samples = (generated_images + 1) / 2
-        self.fid.update(samples, real=False)
-        fid_score = self.fid.compute()
-        self.fid.reset()
+            # print('Computing Inception Metric.')
+            self.inception_metric.update(samples)
+            inception_score = self.inception_metric.compute()[0]
+            self.inception_metric.reset()
 
-        self.inception_metric.update(samples)
-        inception_score = self.inception_metric.compute()[0]
+            # print('Computing PCA Score.')
+            pca_score = self.pca_instance.score(generated_images)
 
-        return fid_score, inception_score
+            # print(f'Computing Wasserstein Distances between {generated_images.shape} and {self.sample_train_images.shape}.')
+            train_wd = wasserstein_distance_nd(generated_images[::10], self.sample_train_images[::4])
+            val_wd = wasserstein_distance_nd(generated_images[::10], self.sample_val_images)
+
+        return inception_score, pca_score, train_wd, val_wd
 
 
 calculate(Configs.generator, 'resnet', lambda c: CIFAR10Generator().to(c.device))
@@ -300,21 +324,24 @@ def main():
     # Create configs object
     conf = Configs()
     # Create experiment
-    exp_name = 'CIFAR10_1.0'
+    exp_name = 'CIFAR10_LR1e-4_GP1.0_L4.0'
     experiment.create(name=exp_name, writers={'tensorboard'})
     # Override configurations
     experiment.configs(conf,
                        {
                            'discriminator': 'conv',
                            'generator': 'resnet',
+                           'inverse_generator': 'cnn',
                            'label_smoothing': 0.0,
                            'generator_loss': 'wasserstein',
                            'discriminator_loss': 'wasserstein',
                            'discriminator_k': 5,
-                           'train_batch_size': 256,
-                           'valid_batch_size': 256,
-                           'epochs': 300,
-                           'inverse_penalty_coefficient': 8.0,
+                           'train_batch_size': 512,
+                           'valid_batch_size': 512,
+                           'epochs': 1000,
+                           'inverse_penalty_coefficient': 4.0,
+                           'gradient_penalty_coefficient': 1.0,
+                           'valid_loader_shuffle': True
                        })
 
     experiment.add_pytorch_models({'generator': conf.generator,

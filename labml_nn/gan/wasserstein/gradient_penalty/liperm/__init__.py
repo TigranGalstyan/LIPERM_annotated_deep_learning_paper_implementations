@@ -42,11 +42,13 @@ In this implementation we set $\epsilon = 1$.
 
 Here is the [code for an experiment](experiment.html) that uses gradient penalty.
 """
+from collections import OrderedDict
 from typing import List
 
 
 import torch
 import torch.nn as nn
+from torch.utils import model_zoo
 from torch.utils.data import DataLoader, Dataset
 
 from labml_helpers.module import Module
@@ -272,11 +274,11 @@ class SwissRollConfigs(BaseConfigs):
     train_loader: DataLoader
     valid_loader: DataLoader
 
-    train_data_size: int = 5000
-    val_data_size: int = 5000
+    train_data_size: int = 2000
+    val_data_size: int = 2000
 
-    train_batch_size: int = 256
-    valid_batch_size: int = 1024
+    train_batch_size: int = 200
+    valid_batch_size: int = 200
 
     train_loader_shuffle: bool = True
     valid_loader_shuffle: bool = False
@@ -374,3 +376,43 @@ class SwissRollDiscriminator(nn.Module):
     def forward(self, inputs):
         output = self.main(inputs)
         return output
+
+
+model_urls = {
+    'mnist': 'http://ml.cs.tsinghua.edu.cn/~chenxi/pytorch-models/mnist-b07bb66b.pth'
+}
+
+class PretrainedMnist(nn.Module):
+    def __init__(self, input_dims, n_hiddens, n_class):
+        super(PretrainedMnist, self).__init__()
+        assert isinstance(input_dims, int), 'Please provide int for input_dims'
+        self.input_dims = input_dims
+        current_dims = input_dims
+        layers = OrderedDict()
+
+        if isinstance(n_hiddens, int):
+            n_hiddens = [n_hiddens]
+        else:
+            n_hiddens = list(n_hiddens)
+        for i, n_hidden in enumerate(n_hiddens):
+            layers['fc{}'.format(i+1)] = nn.Linear(current_dims, n_hidden)
+            layers['relu{}'.format(i+1)] = nn.ReLU()
+            layers['drop{}'.format(i+1)] = nn.Dropout(0.2)
+            current_dims = n_hidden
+        layers['out'] = nn.Linear(current_dims, n_class)
+
+        self.model= nn.Sequential(layers)
+        print(self.model)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        assert x.size(1) == self.input_dims
+        return self.model.forward(x)
+
+
+def get_pretrained_mnist_model(device, input_dims=784, n_hiddens=(256, 256), n_class=10):
+    model = PretrainedMnist(input_dims, n_hiddens, n_class)
+    m = model_zoo.load_url(model_urls['mnist'])
+    state_dict = m.state_dict() if isinstance(m, nn.Module) else m
+    model.load_state_dict(state_dict)
+    return model.to(device)

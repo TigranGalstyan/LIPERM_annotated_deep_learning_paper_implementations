@@ -9,19 +9,23 @@ summary: This experiment generates MNIST images using convolutional neural netwo
 from typing import Any
 
 import torch
+from torch import nn
 from labml_helpers.train_valid import BatchIndex
 from torchvision.utils import make_grid
-from torchmetrics.image.fid import FrechetInceptionDistance
+# from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 
-from labml import experiment, tracker
+from labml import tracker, monit, experiment
 
 # Import configurations from [Wasserstein experiment](../experiment.html)
 from labml_nn.gan.wasserstein.gradient_penalty.experiment import Configs as OriginalConfigs
+from labml_helpers.optimizer import OptimizerConfigs
 #
-from labml.configs import calculate
+
+from labml.configs import option, calculate
 from labml_nn.gan.wasserstein.gradient_penalty.liperm import InverseGeneratorLoss
 from labml_nn.gan.wasserstein.gradient_penalty.liperm import MNISTInverseGenerator
+from labml_nn.gan.wasserstein.gradient_penalty.liperm import get_pretrained_mnist_model
 
 
 class Configs(OriginalConfigs):
@@ -33,18 +37,22 @@ class Configs(OriginalConfigs):
     """
 
     # Inverse penalty coefficient $\lambda$
-    inverse_penalty_coefficient: float = 1.0
+    inverse_penalty_coefficient: float = 0.0
     #
     inverse_generator_loss = InverseGeneratorLoss()
     inverse_generator = 'cnn'
-    fid = FrechetInceptionDistance(normalize=True, reset_real_features=False, feature=2048)
+    inverse_generator_optimizer: torch.optim.Optimizer
     inception_metric = InceptionScore(normalize=True)
+
+    pretrained_classification_model: torch.nn.Module
 
     def __init__(self):
         super(Configs, self).__init__()
         if self.device.type == 'cuda':
-            self.fid.cuda(self.device)
+            # self.fid.cuda(self.device)
             self.inception_metric.cuda(self.device)
+
+        self.pretrained_classification_model = get_pretrained_mnist_model(device=self.device)
 
     def calc_generator_loss(self, batch_size: int):
         """
@@ -64,48 +72,94 @@ class Configs(OriginalConfigs):
         tracker.add("loss.generator.", generator_loss)
         tracker.add("loss.inverse_generator.", inverse_loss)
         tracker.add("loss.overall.", loss)
+        tracker.add("MC_score_max.", self.calc_mc_score(generated_images))
+        tracker.add("InceptionScore.", self.calc_inception_score(generated_images))
 
         return loss
-
-    def get_fid_and_inception_score(self, batch_size=100):
-        with torch.no_grad():
-            latent = self.sample_z(batch_size)
-            generated_images = self.generator(latent)
-
-        samples = (generated_images + 1) / 2
-        samples_3c = samples.tile(dims=(1, 3, 1, 1))
-        self.fid.update(samples_3c, real=False)
-        fid_score = self.fid.compute()
-        self.fid.reset()
-
-        self.inception_metric.update(samples_3c)
-        inception_score = self.inception_metric.compute()[0]
-
-        return fid_score, inception_score
 
     def step(self, batch: Any, batch_idx: BatchIndex):
         """
         Take a training step
         """
-        super().step(batch, batch_idx)
-        batch_size = batch[0].shape[0]
+
+        # Set model states
+        self.generator.train(self.mode.is_train)
+        self.discriminator.train(self.mode.is_train)
 
         # Memory leak workaround
         if len(self.inception_metric.features) > 500:
             self.inception_metric.reset()
 
-        if tracker.get_global_step() < batch_idx.total * batch_size:
-            # Get MNIST images
-            data = batch[0].to(self.device)
-            data_3c = torch.tile((data + 1.0) / 2.0, dims=(1, 3, 1, 1))
-            self.fid.update(data_3c, real=True)
+        # Get MNIST images
+        data = batch[0].to(self.device)
 
-        # Compute metrics once in every `discriminator_k`
+        # Increment step in training mode
+        if self.mode.is_train:
+            tracker.add_global_step(len(data))
+
+        # Train the discriminator
+        with monit.section("discriminator"):
+            # Get discriminator loss
+            loss = self.calc_discriminator_loss(data)
+
+            # Train
+            if self.mode.is_train:
+                self.discriminator_optimizer.zero_grad()
+                loss.backward()
+                if batch_idx.is_last:
+                    tracker.add('discriminator', self.discriminator)
+                self.discriminator_optimizer.step()
+
+        # Train the generator once in every `discriminator_k`
         if batch_idx.is_interval(self.discriminator_k):
-            fid_score, inception_score = self.get_fid_and_inception_score(batch_size=batch_size)
-            tracker.add("FrechetInceptionDistance.", fid_score)
-            tracker.add("InceptionScore.", inception_score)
+            with monit.section("generator"):
+                loss = self.calc_generator_loss(data.shape[0])
 
+                # Train
+                if self.mode.is_train:
+                    self.generator_optimizer.zero_grad()
+                    self.inverse_generator_optimizer.zero_grad()
+                    loss.backward()
+                    if batch_idx.is_last:
+                        tracker.add('generator', self.generator)
+                    self.generator_optimizer.step()
+                    self.inverse_generator_optimizer.step()
+
+        tracker.save()
+
+    def calc_mc_score(self, generated_images: torch.Tensor):
+
+        classes = self.pretrained_classification_model(generated_images).argmax(dim=-1, keepdims=False)
+        num_digits = 10
+        batch_size = classes.size(0)
+        c = classes.type(torch.IntTensor).flatten()
+        bins = torch.bincount(c, minlength=num_digits)
+        # deviation = ((bins - batch_size / 10) ** 2).mean().sqrt() / batch_size
+        deviation = bins.max() / batch_size -  1 / 10
+        return deviation
+
+    def calc_inception_score(self, generated_images: torch.Tensor):
+
+        samples = (generated_images + 1) / 2
+        samples_3c = samples.tile(dims=(1, 3, 1, 1))
+
+        self.inception_metric.update(samples_3c)
+        inception_score = self.inception_metric.compute()[0]
+
+        return inception_score
+
+
+@option(Configs.inverse_generator_optimizer)
+def _inverse_generator_optimizer(c: Configs):
+    opt_conf = OptimizerConfigs()
+    opt_conf.optimizer = 'Adam'
+    opt_conf.parameters = c.inverse_generator.parameters()
+    opt_conf.learning_rate = 2.5e-4
+    # Setting exponent decay rate for first moment of gradient,
+    # $\beta_1$ to `0.5` is important.
+    # Default of `0.9` fails.
+    opt_conf.betas = (0.5, 0.999)
+    return opt_conf
 
 calculate(Configs.inverse_generator, 'cnn', lambda c: MNISTInverseGenerator().to(c.device))
 
@@ -114,7 +168,7 @@ def main():
     # Create configs object
     conf = Configs()
     # Create experiment
-    exp_name = 'MNIST_DEBug'
+    exp_name = 'MNIST_WGANGP_liperm0'
     experiment.create(name=exp_name, writers={'tensorboard'})
     # Override configurations
     experiment.configs(conf,
@@ -128,12 +182,14 @@ def main():
                            'train_batch_size': 256,
                            'valid_batch_size': 256,
                            'epochs': 25,
-                           'inverse_penalty_coefficient': 0.5
+                           'inverse_penalty_coefficient': 0
                        })
 
-    # Start the experiment and run training loop
-    # with experiment.record(name='MNIST_DEBUG', token='http://localhost:7778/api/v1/track?', writers={'tensorboard'}):
-    experiment.add_pytorch_models({'generator': conf.generator})
+    experiment.add_pytorch_models({
+        'generator': conf.generator,
+        'discriminator': conf.discriminator,
+        'inverse_generator': conf.inverse_generator
+    })
     with experiment.start():
         conf.run()
 
