@@ -9,8 +9,9 @@ summary: This experiment generates MNIST images using convolutional neural netwo
 from typing import Any
 
 import torch
-from torch import nn
+import numpy as np
 from labml_helpers.train_valid import BatchIndex
+from scipy.stats import wasserstein_distance_nd
 from torchvision.utils import make_grid
 # from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
@@ -53,6 +54,20 @@ class Configs(OriginalConfigs):
             self.inception_metric.cuda(self.device)
 
         self.pretrained_classification_model = get_pretrained_mnist_model(device=self.device)
+        self.sample_train_images = torch.stack(self.collect_sample_images(train=True)).flatten(start_dim=1)
+        self.sample_val_images = torch.stack(self.collect_sample_images(train=False)).flatten(start_dim=1)
+
+
+    def collect_sample_images(self, train=True, num=256):
+        samples = []
+        if train:
+            dataset = self.train_dataset
+        else:
+            dataset = self.valid_dataset
+
+        for i in np.random.permutation(np.arange(len(dataset)))[:num]:
+            samples.append(self.train_dataset[i][0])
+        return samples
 
     def calc_generator_loss(self, batch_size: int):
         """
@@ -74,6 +89,10 @@ class Configs(OriginalConfigs):
         tracker.add("loss.overall.", loss)
         tracker.add("MC_score_max.", self.calc_mc_score(generated_images))
         tracker.add("InceptionScore.", self.calc_inception_score(generated_images))
+
+        train_wd, val_wd = self.calculate_wd(generated_images)
+        tracker.add("WassersteinDistanceTrain.", train_wd)
+        tracker.add("WassersteinDistanceVal.", val_wd)
 
         return loss
 
@@ -147,6 +166,11 @@ class Configs(OriginalConfigs):
         inception_score = self.inception_metric.compute()[0]
 
         return inception_score
+
+    def calculate_wd(self, generated):
+        train_wd = wasserstein_distance_nd(generated.flatten(start_dim=1), self.sample_train_images)
+        val_wd = wasserstein_distance_nd(generated.flatten(start_dim=1), self.sample_val_images)
+        return train_wd, val_wd
 
 
 @option(Configs.inverse_generator_optimizer)
