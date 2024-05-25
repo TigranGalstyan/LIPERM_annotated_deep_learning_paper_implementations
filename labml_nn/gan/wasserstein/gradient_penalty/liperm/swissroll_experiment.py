@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import torch
 from torchvision import transforms
 from scipy.spatial import KDTree
+from scipy.stats import wasserstein_distance_nd #wasserstein_distance
+
 
 
 from labml import tracker, monit, experiment
@@ -200,7 +202,15 @@ class Configs(SwissRollConfigs, TrainValidConfigs):
         tracker.add("loss.overall.", loss)
         tracker.add("dissimilarity_score", self.calculate_dissimiliarity_score(generated_points_cpu, skip_step=1))
 
+        train_wd, val_wd = self.calculate_wd(generated_points_cpu, skip_step=10)
+        tracker.add("WassersteinDistanceTrain.", train_wd)
+        tracker.add("WassersteinDistanceVal.", val_wd)
         return loss
+
+    def calculate_wd(self, generated, skip_step=10):
+        train_wd = wasserstein_distance_nd(generated, self.train_dataset.data[::skip_step])
+        val_wd = wasserstein_distance_nd(generated, self.valid_dataset.data[::skip_step])
+        return train_wd, val_wd
 
     def calculate_dissimiliarity_score(self, generated, skip_step=10):
         # calculates the minimum distances, higher the better
