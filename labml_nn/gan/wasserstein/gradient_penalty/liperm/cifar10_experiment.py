@@ -74,7 +74,7 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
     inception_metric = InceptionScore(normalize=True, splits=1)
     sample_train_images: torch.Tensor = None
     sample_val_images: torch.Tensor = None
-    pca_instance: PCA = None
+    # pca_instance: PCA = None
     valid_loader_shuffle: True
 
     def init(self):
@@ -95,8 +95,8 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
         self.sample_train_images = torch.stack(self.collect_sample_images(train=True)).flatten(start_dim=1)
         self.sample_val_images = torch.stack(self.collect_sample_images(train=False, num=256)).flatten(start_dim=1)
 
-        self.pca_instance = PCA(n_components=10)
-        self.pca_instance.fit(self.sample_train_images)
+        # self.pca_instance = PCA(n_components=10)
+        # self.pca_instance.fit(self.sample_train_images)
 
     def collect_sample_images(self, train=True, num=1024):
         samples = []
@@ -164,11 +164,11 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
         # # Compute metrics once in every `discriminator_k`
         # if batch_idx.is_interval(self.discriminator_k):
         if not self.mode.is_train and batch_idx.is_last:
-            inception_score, pca_score, train_wd, val_wd = self.get_scores(batch_size=batch_size)
+            inception_score, train_wd, val_wd = self.get_scores(batch_size=batch_size)
             tracker.add("InceptionScore.", inception_score)
             tracker.add("WassersteinDistanceTrain.", train_wd)
             tracker.add("WassersteinDistanceVal.", val_wd)
-            tracker.add("PCAScore.", pca_score)
+            # tracker.add("PCAScore.", pca_score)
         tracker.save()
 
     def calc_discriminator_loss(self, data: torch.Tensor):
@@ -216,7 +216,7 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
         loss = generator_loss + self.inverse_penalty_coefficient * inverse_loss
 
         # Log stuff
-        tracker.add('generated', make_grid(generated_images[0:25], nrow=5, pad_value=1.0))
+        tracker.add('generated', make_grid((generated_images[0:25] + 1 ) / 2, nrow=5, pad_value=1.0))
         tracker.add("loss.generator.", generator_loss)
         tracker.add("loss.inverse_generator.", inverse_loss)
         tracker.add("loss.overall.", loss)
@@ -236,13 +236,14 @@ class Configs(CIFAR10Configs, TrainValidConfigs):
             self.inception_metric.reset()
 
             # print('Computing PCA Score.')
-            pca_score = self.pca_instance.score(generated_images)
+            # pca_score = self.pca_instance.score(generated_images)
 
             # print(f'Computing Wasserstein Distances between {generated_images.shape} and {self.sample_train_images.shape}.')
             train_wd = wasserstein_distance_nd(generated_images[::10], self.sample_train_images[::4])
             val_wd = wasserstein_distance_nd(generated_images[::10], self.sample_val_images)
 
-        return inception_score, pca_score, train_wd, val_wd
+        # return inception_score, pca_score, train_wd, val_wd
+        return inception_score, train_wd, val_wd
 
 
 calculate(Configs.generator, 'resnet', lambda c: CIFAR10Generator().to(c.device))
@@ -324,7 +325,7 @@ def main():
     # Create configs object
     conf = Configs()
     # Create experiment
-    exp_name = 'CIFAR10_LR1e-4_GP1.0_L4.0'
+    exp_name = 'CIFAR10_LR1e-4_GP1.0_L8.0_slurm_bs512'
     experiment.create(name=exp_name, writers={'tensorboard'})
     # Override configurations
     experiment.configs(conf,
@@ -339,7 +340,7 @@ def main():
                            'train_batch_size': 512,
                            'valid_batch_size': 512,
                            'epochs': 1000,
-                           'inverse_penalty_coefficient': 4.0,
+                           'inverse_penalty_coefficient': 8.0,
                            'gradient_penalty_coefficient': 1.0,
                            'valid_loader_shuffle': True
                        })

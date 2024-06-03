@@ -26,7 +26,6 @@ from labml_helpers.optimizer import OptimizerConfigs
 from labml.configs import option, calculate
 from labml_nn.gan.wasserstein.gradient_penalty.liperm import InverseGeneratorLoss
 from labml_nn.gan.wasserstein.gradient_penalty.liperm import MNISTInverseGenerator
-from labml_nn.gan.wasserstein.gradient_penalty.liperm import get_pretrained_mnist_model
 
 
 class Configs(OriginalConfigs):
@@ -43,20 +42,25 @@ class Configs(OriginalConfigs):
     inverse_generator_loss = InverseGeneratorLoss()
     inverse_generator = 'cnn'
     inverse_generator_optimizer: torch.optim.Optimizer
-    inception_metric = InceptionScore(normalize=True)
+    inception_metric = InceptionScore(normalize=True, splits=1)
 
-    pretrained_classification_model: torch.nn.Module
+    sample_train_images: torch.Tensor
+    sample_val_images: torch.Tensor
+    valid_loader_shuffle = True
 
     def __init__(self):
         super(Configs, self).__init__()
+
+        tracker.set_scalar("loss.generator.*", True)
+        tracker.set_scalar("loss.discriminator.*", True)
+        tracker.set_image("Generated Images", True)
+
         if self.device.type == 'cuda':
             # self.fid.cuda(self.device)
             self.inception_metric.cuda(self.device)
 
-        self.pretrained_classification_model = get_pretrained_mnist_model(device=self.device)
         self.sample_train_images = torch.stack(self.collect_sample_images(train=True)).flatten(start_dim=1)
         self.sample_val_images = torch.stack(self.collect_sample_images(train=False)).flatten(start_dim=1)
-
 
     def collect_sample_images(self, train=True, num=256):
         samples = []
@@ -67,6 +71,7 @@ class Configs(OriginalConfigs):
 
         for i in np.random.permutation(np.arange(len(dataset)))[:num]:
             samples.append(self.train_dataset[i][0])
+
         return samples
 
     def calc_generator_loss(self, batch_size: int):
@@ -82,17 +87,9 @@ class Configs(OriginalConfigs):
 
         loss = generator_loss + self.inverse_penalty_coefficient * inverse_loss
 
-        # Log stuff
-        tracker.add('generated', make_grid(generated_images[0:25], nrow=5, pad_value=1.0))
         tracker.add("loss.generator.", generator_loss)
         tracker.add("loss.inverse_generator.", inverse_loss)
         tracker.add("loss.overall.", loss)
-        tracker.add("MC_score_max.", self.calc_mc_score(generated_images))
-        tracker.add("InceptionScore.", self.calc_inception_score(generated_images))
-
-        train_wd, val_wd = self.calculate_wd(generated_images)
-        tracker.add("WassersteinDistanceTrain.", train_wd)
-        tracker.add("WassersteinDistanceVal.", val_wd)
 
         return loss
 
@@ -144,41 +141,62 @@ class Configs(OriginalConfigs):
                     self.generator_optimizer.step()
                     self.inverse_generator_optimizer.step()
 
+        if not self.mode.is_train and batch_idx.is_last:
+
+            train_wd, val_wd, inception_score, generated_images = self.get_scores(batch_size=data.shape[0])
+            tracker.add("WassersteinDistanceTrain.", train_wd)
+            tracker.add("WassersteinDistanceVal.", val_wd)
+            tracker.add('Generated Images', make_grid(generated_images[0:25, [0]], nrow=5, pad_value=1.0))
+            tracker.add("InceptionScore.", inception_score)
         tracker.save()
 
-    def calc_mc_score(self, generated_images: torch.Tensor):
+    def get_scores(self, batch_size: int):
+        with torch.no_grad():
+            latent = self.sample_z(batch_size)
+            batch = self.generator(latent)
+            train_wd = wasserstein_distance_nd(batch.detach().cpu().flatten(start_dim=1)[::8], self.sample_train_images)
+            val_wd = wasserstein_distance_nd(batch.detach().cpu().flatten(start_dim=1)[::8], self.sample_val_images)
 
-        classes = self.pretrained_classification_model(generated_images).argmax(dim=-1, keepdims=False)
-        num_digits = 10
-        batch_size = classes.size(0)
-        c = classes.type(torch.IntTensor).flatten()
-        bins = torch.bincount(c, minlength=num_digits)
-        # deviation = ((bins - batch_size / 10) ** 2).mean().sqrt() / batch_size
-        deviation = bins.max() / batch_size -  1 / 10
-        return deviation
+            generated_images = batch  # Denormalization
+            generated_images_3c = generated_images.tile(dims=(1, 3, 1, 1))
 
-    def calc_inception_score(self, generated_images: torch.Tensor):
+            self.inception_metric.update((generated_images_3c + 1 ) / 2)
+            inception_score = self.inception_metric.compute()[0]
+            self.inception_metric.reset()
 
-        samples = (generated_images + 1) / 2
-        samples_3c = samples.tile(dims=(1, 3, 1, 1))
-
-        self.inception_metric.update(samples_3c)
-        inception_score = self.inception_metric.compute()[0]
-
-        return inception_score
-
-    def calculate_wd(self, generated):
-        train_wd = wasserstein_distance_nd(generated.flatten(start_dim=1), self.sample_train_images)
-        val_wd = wasserstein_distance_nd(generated.flatten(start_dim=1), self.sample_val_images)
-        return train_wd, val_wd
-
+        return train_wd, val_wd, inception_score, generated_images
 
 @option(Configs.inverse_generator_optimizer)
 def _inverse_generator_optimizer(c: Configs):
     opt_conf = OptimizerConfigs()
     opt_conf.optimizer = 'Adam'
     opt_conf.parameters = c.inverse_generator.parameters()
-    opt_conf.learning_rate = 2.5e-4
+    opt_conf.learning_rate = 1e-4
+    # Setting exponent decay rate for first moment of gradient,
+    # $\beta_1$ to `0.5` is important.
+    # Default of `0.9` fails.
+    opt_conf.betas = (0.5, 0.999)
+    return opt_conf
+
+@option(Configs.discriminator_optimizer)
+def _discriminator_optimizer(c: Configs):
+    opt_conf = OptimizerConfigs()
+    opt_conf.optimizer = 'Adam'
+    opt_conf.parameters = c.discriminator.parameters()
+    opt_conf.learning_rate = 1e-4
+    # Setting exponent decay rate for first moment of gradient,
+    # $\beta_1$ to `0.5` is important.
+    # Default of `0.9` fails.
+    opt_conf.betas = (0.5, 0.999)
+    return opt_conf
+
+
+@option(Configs.generator_optimizer)
+def _generator_optimizer(c: Configs):
+    opt_conf = OptimizerConfigs()
+    opt_conf.optimizer = 'Adam'
+    opt_conf.parameters = c.generator.parameters()
+    opt_conf.learning_rate = 1e-4
     # Setting exponent decay rate for first moment of gradient,
     # $\beta_1$ to `0.5` is important.
     # Default of `0.9` fails.
@@ -192,7 +210,7 @@ def main():
     # Create configs object
     conf = Configs()
     # Create experiment
-    exp_name = 'MNIST_WGANGP_liperm0'
+    exp_name = 'MNIST_WGANGP_liperm8.0'
     experiment.create(name=exp_name, writers={'tensorboard'})
     # Override configurations
     experiment.configs(conf,
@@ -203,10 +221,10 @@ def main():
                            'generator_loss': 'wasserstein',
                            'discriminator_loss': 'wasserstein',
                            'discriminator_k': 5,
-                           'train_batch_size': 256,
-                           'valid_batch_size': 256,
-                           'epochs': 25,
-                           'inverse_penalty_coefficient': 0
+                           'train_batch_size': 512,
+                           'valid_batch_size': 512,
+                           'epochs': 500,
+                           'inverse_penalty_coefficient': 8.0
                        })
 
     experiment.add_pytorch_models({
